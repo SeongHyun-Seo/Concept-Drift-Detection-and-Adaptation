@@ -1,0 +1,95 @@
+# Concept Drift Detection Method - Alternating Learners (AL) Framework
+
+def alternating_learners_original_hours(data, feature, target, l_start, l_end, v_limit, batch_size=1, w=10, tau=1, delta=0.2, n0=5):
+    '''
+    논문 기준 Alternating Learners (AL) framework 구현한 함수
+
+    Parameters
+    ----------
+    data : pd.DataFrame
+        분석 대상 데이터
+    features : list
+        모델 구성에 활용할 변수 목록
+    target : string
+        목적 변수의 이름
+    l_start : Timestamp
+        최초 LW 구간의 시작점, 즉, 최초 학습 구간의 종료점
+    l_end : Timestamp
+        최초 LW 구간의 종료점
+    v_limit : Timestamp
+        분석 종료점
+    batch_size : int
+        한 번에 고려할 데이터의 개수. Default는 1.
+    w : int
+        SW의 크기. Default는 10.
+    tau : float
+        공정 이상을 확인할지 결정하는 파라미터, 이 값보다 작은 모델은 AL을 적용할 필요가 없음. Default는 1.
+    delta : float
+        공정 이상이 발생했는지 결정하는 파라미터. Default는 0.2.
+    n0 : int
+        공정 이상을 탐지할 때, 민감도를 조절하기 위한 파라미터, 모델 교체 후 n0 * batch_size만큼의 data에 대해서는 공정 이상 여부를 탐지하지 않음. Default는 5.
+
+    Returns
+    -------
+    cd_date : list of Timestamp
+        공정 이상 발생 일자 모음
+    err_df : pd.DataFrame
+        각 시점별 error 크기, Q의 길이 등 다양한 정보를 확인하기 위한 DataFrame
+
+    '''
+    cd_date = [] #CD로 판단된 날짜에 대해 저장/return할 list
+    q = [] #모델 교체 여부를 판단해 저장할 queue
+    err_list = [] #error 추이를 확인하기 위한 list(AL framework상에서는 사용 X)
+    while l_end+timedelta(hours=batch_size) < v_limit:
+        try:
+            #Long-time window(LW)
+            df_l = data[(data.index>l_start)&(data.index<=l_end)]
+            x_l = df_l[feature]
+            y_l = df_l[target]
+            
+            #Short-time window(SW)
+            df_s = data[(data.index>l_end-timedelta(hours=batch_size*w))&(data.index<=l_end)]
+            x_s = df_s[feature]
+            y_s = df_s[target]
+            
+            #New batch for measuring error(N)
+            df_n = data[(data.index>l_end)&(data.index<=l_end+timedelta(hours=batch_size))]
+            x_n = df_n[feature]
+            y_n = df_n[target]
+    
+            #LASSO model for LW, SW
+            model_l = LinearRegression().fit(x_l, y_l)   
+            model_s = LinearRegression().fit(x_s, y_s)
+            
+            #LW를 학습한 모델 L과 SW를 학습한 모델 S으로 N에 대한 error 측정
+            pred_l = model_l.predict(x_n)
+            pred_s = model_s.predict(x_n)
+            err_l = mean_absolute_percentage_error(y_n, pred_l)
+            err_s = mean_absolute_percentage_error(y_n, pred_s)
+            
+            #AL framework
+            if err_l < tau: #err_l이 허용 범위보다 큰 값인 경우
+                cd_type = 0
+            else:
+                if err_l <= err_s: #err_l이 err_s보다 작은 경우, SW로는 LW를 대체하기 어려움 -> 모델 교체가 불가능하므로 q에 0 추가
+                    cd_type = 0
+                else: #err_l이 err_s보다 큰 경우, SW가 LW보다 새로운 concept에 알맞은 데이터 -> 모델 교체가 필요하므로 q에 1 추가
+                    print(l_end, round(err_l,4))
+                    cd_type = 1
+            q.append(cd_type)
+            if len(q)>w:
+                q=q[1:]
+            if len(q) >= n0 and (sum(q)/len(q)) >= delta: #충분한 개수의 batch를 확인하고, 그 중 모델 교체가 필요한 경우가 일정 비율 이상인 경우,
+                err_list.append([l_end, err_s, err_l, err_s, cd_type, len(q), sum(q)/len(q),'yes'])
+                print(l_start, l_end, q)
+                q = []  #q 초기화
+                cd_date.append(l_end) #cd_date에 현재 LW의 종료 날짜 추가
+                l_start = l_end - timedelta(hours=batch_size*w) #LW를 SW로 대체
+            else: #LW 확장만 수행하면 되는 경우
+                err_list.append([l_end, err_l, err_l, err_s, cd_type, len(q), sum(q)/len(q),'no'])
+            l_end = l_end+timedelta(hours=batch_size) #LW, SW, N 모두 batch size 하나만큼 이동
+        except:  #주어진 데이터에서 더 이상 N으로 이동이 불가능한 경우 or 새로운 SW 또는 N에 해당하는 날짜가 결측되어 error 계산이 불가능한 경우, 날짜 이동만 수행
+            l_end = l_end+timedelta(hours=batch_size)
+    err_df = pd.DataFrame(err_list, columns=['TIME','error','err_l','err_s','cd','q_length','q_ratio','replacement'])
+    err_df.set_index('TIME',inplace=True)
+    return cd_date, err_df
